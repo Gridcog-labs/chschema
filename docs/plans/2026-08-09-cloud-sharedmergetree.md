@@ -1,6 +1,6 @@
 # ClickHouse Cloud — reading the `Shared*MergeTree` engines
 
-Status: design approved 2026-08-09; implementation in progress.
+Status: implemented 2026-08-09, awaiting review.
 First step of running `hclexp` against ClickHouse Cloud.
 
 ## Problem
@@ -167,6 +167,24 @@ a false "no drift".
   probe once per connection and pass the result into each per-database
   introspect. That covers `introspect`, `dump-cluster`, and the live
   side of `diff`, `plan`, `drift` and `load`.
+
+## Containing parser panics (found while verifying)
+
+Replaying all 341 real `create_table_query` values from a live Cloud service
+through the introspection path turned up a second blocker. The third-party
+SQL parser panics with a nil dereference on a column `DEFAULT` that uses
+ClickHouse's `<=>` operator:
+
+```sql
+`matches` Bool DEFAULT other_name <=> name
+```
+
+Nothing to do with Cloud — a self-hosted server carrying that column would
+panic too. It matters here because a panic takes down the whole run *and*
+bypasses `-allow-raw`, so a single such table makes the service impossible to
+introspect at all.
+
+Fixed by implementing `safeParseStmts`.
 
 ## Verification against a live Cloud service
 
