@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 
 	chparser "github.com/orian/clickhouse-sql-parser/parser"
 )
@@ -292,7 +293,24 @@ func normalizeColumnTypePtr(p **string) {
 	}
 	if nt, ok := normalizeColumnType(**p); ok {
 		*p = &nt
+	} else {
+		warnUncanonicalType(**p)
 	}
+}
+
+// uncanonicalTypes remembers which type strings have already been reported, so
+// one unreadable type used across a hundred tables warns once per run.
+var uncanonicalTypes sync.Map
+
+// warnUncanonicalType reports a type that could not be reduced to canonical
+// form. Without this the degradation is silent, and the symptom — that column
+// diffing forever on a spelling difference — has no visible cause. The type
+// string is the searchable key, so no table context is threaded in.
+func warnUncanonicalType(typ string) {
+	if _, seen := uncanonicalTypes.LoadOrStore(typ, struct{}{}); seen {
+		return
+	}
+	slog.Warn("column type could not be canonicalized; keeping raw (may diff as drift)", "type", typ)
 }
 
 // normalizeTTL canonicalizes a table TTL clause to the same text introspection
@@ -354,6 +372,8 @@ func canonicalize(db *DatabaseSpec) {
 		for ai := range attrs {
 			if nt, ok := normalizeColumnType(attrs[ai].Type); ok {
 				attrs[ai].Type = nt
+			} else {
+				warnUncanonicalType(attrs[ai].Type)
 			}
 		}
 	}
@@ -414,6 +434,8 @@ func normalizeColumnExprs(cols []ColumnSpec) {
 		c := &cols[ci]
 		if nt, ok := normalizeColumnType(c.Type); ok {
 			c.Type = nt
+		} else {
+			warnUncanonicalType(c.Type)
 		}
 		normalizeExprPtr(&c.Default)
 		normalizeExprPtr(&c.Materialized)

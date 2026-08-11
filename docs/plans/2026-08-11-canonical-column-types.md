@@ -68,6 +68,51 @@ patch forms), and dictionary attributes. MV columns were not visited at
 all before, so their expressions are now canonicalized as well, matching
 declared table columns.
 
+## What happens when ClickHouse changes
+
+The canonical form copies the server's, so a future ClickHouse could move
+away from it. The two directions are not symmetrical, and only one is
+harmful.
+
+**We normalize less than the server.** Say a version starts sorting
+`SKIP REGEXP`. The server then reports a sorted form, we keep the authored
+order, the two never match, and every schema carrying that type diffs
+forever — the reported bug, back again. This is the direction to guard.
+
+**We normalize more than the server.** Say a version stops sorting typed
+paths. Both the authored and the introspected type still pass through our
+sort, so they still match and nothing spurious appears. The cost is that a
+difference the server can see is called equal — and for an option set that
+difference cannot change storage or query results, so this is a cosmetic
+false negative, not a wrong migration.
+
+`TestCHLive_ColumnTypeCanonicalFormMatchesServer` guards the harmful
+direction, and it guards it in CI: the `test-live` job runs the live suite
+against the docker-compose ClickHouse on every pull request, and `build`
+depends on it. The test declares each type in a non-canonical spelling,
+introspects it, and asserts the introspected form equals the canonicalized
+*authored* form. If a version bump changes the server's naming rules, that
+assertion fails on the bump rather than in someone's diff.
+
+The deeper risk is the SQL parser, not ClickHouse: normalization renders a
+third-party AST back to text, so a parser release that accepts a type but
+drops part of it would change what hclexp generates — the only failure here
+that could alter a real table rather than add noise.
+`TestNormalizeColumnType_ChangesLayoutOnly` pins that: a corpus of real
+types must come back identical once whitespace is removed. Auditing ~34
+type shapes found no content loss today, and one type the parser cannot
+read at all (`Dynamic(max_types=10)`), which correctly degrades to
+verbatim. That degradation used to be silent; `warnUncanonicalType` now
+reports it once per distinct type per run, so a column that diffs forever
+has a visible cause.
+
+A more conservative design was considered and rejected: canonicalize only
+for the comparison and keep the authored text for DDL, so a lossy parser
+render could never reach a cluster. It would make types the one field whose
+stored value is not canonical, breaking the property that a dump and a
+declaration converge, and it contradicts how queries and TTL already work.
+The layout-only corpus addresses the same risk without that cost.
+
 ## Deliberately out of scope
 
 `Enum8('b' = 2, 'a' = 1)` is also order-independent when every element

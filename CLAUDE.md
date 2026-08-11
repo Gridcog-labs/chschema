@@ -128,8 +128,13 @@ The `justfile` has the full recipe list.
   `SKIP REGEXP` order, `Tuple`/`Nested` element order, enum element order and a
   `max_dynamic_*` set to its default all still compare as they do on the
   server. An unparseable type, and a `type` smuggling in a modifier, are kept
-  verbatim. Applies to `patch_table` columns, `patch_column`, MV columns and
-  dictionary attributes
+  verbatim (warned once per distinct type, since the symptom is a column that
+  diffs forever). Applies to `patch_table` columns, `patch_column`, MV columns
+  and dictionary attributes. Two tests hold the assumptions: a live one
+  (CI `test-live`) asserting the canonicalized authored type equals the
+  introspected type, so a ClickHouse upgrade that renames types fails on the
+  bump; and a layout-only corpus asserting normalization never changes content,
+  so a lossy SQL-parser release can't quietly alter generated DDL
 - ✅ `index` blocks; adding an index to an existing table also generates a
   `MATERIALIZE INDEX` marked manual (`-- MANUAL:` in `diff -sql`,
   `"manual": true` in JSON/plan) — heavy mutations are operator-run, never
