@@ -118,6 +118,29 @@ column "name" {
 of `default`, `materialized`, `ephemeral`, or `alias`; it may also carry
 `codec`, `ttl`, `comment`, and `renamed_from`.
 
+### Type canonicalization
+
+A `type` is parsed and rendered to one canonical form on both load and
+introspection, so how it is written never reads as drift. Two things are
+normalized:
+
+- **Layout** — whitespace and punctuation inside the type.
+  `Map(String,   String)`, `Decimal( 18 , 4 )` and `Enum8('a' = 1)` resolve to
+  `Map(String, String)`, `Decimal(18, 4)` and `Enum8('a'=1)`.
+- **`JSON` option order** — a JSON type's typed-path hints, `SKIP` paths and
+  `max_dynamic_*` parameters are a set, so `JSON(b String, a String)` and
+  `JSON(a String, b String)` are the same type and resolve to one spelling
+  (parameters first, then hints, then skips, each ordered by name). This
+  applies to nested types too, such as `Array(JSON(...))`.
+
+Without this, editing only the spelling of a type produced an
+`ALTER TABLE … MODIFY COLUMN` that rewrote the column to what it already was.
+Element order inside a `Tuple` or `Nested` is meaningful and is left alone.
+
+The same canonicalization runs on `patch_table` columns, `patch_column`,
+materialized-view columns, and dictionary attributes. A type the SQL parser
+cannot read is kept verbatim, so it may still diff as drift.
+
 ## `patch_column`
 
 Inside a table with `extend`, `patch_column` partially specializes one column

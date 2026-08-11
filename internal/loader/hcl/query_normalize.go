@@ -2,6 +2,7 @@ package hcl
 
 import (
 	"log/slog"
+	"sort"
 	"strings"
 
 	chparser "github.com/orian/clickhouse-sql-parser/parser"
@@ -160,6 +161,120 @@ func normalizeExpr(s string) (string, bool) {
 	return formatNode(unwrapRootParens(sel.SelectItems[0].Expr)), true
 }
 
+// normalizeColumnType canonicalizes a column type to the text the parser's
+// printer emits — the same rendering introspection produces in columnFromAST —
+// so two spellings of one type compare equal instead of generating a no-op
+// ALTER TABLE ... MODIFY COLUMN. It covers whitespace and punctuation
+// (`Map(String,   String)`, `Decimal( 18 , 4 )`, `Enum8('a' = 1)`) and, via
+// canonicalizeJSONOptions, the order of the options inside a JSON type. The
+// type is parsed inside a throwaway CREATE TABLE because the grammar accepts a
+// type only in a column position. Returns ok=false with the input unchanged
+// when it can't be parsed, so the caller keeps the raw text.
+func normalizeColumnType(s string) (string, bool) {
+	if strings.TrimSpace(s) == "" {
+		return s, true
+	}
+	stmt, err := parseCreateStatement("CREATE TABLE _norm_type (_c " + s + ") ENGINE = MergeTree ORDER BY tuple()")
+	if err != nil {
+		return s, false
+	}
+	ct, ok := stmt.(*chparser.CreateTable)
+	if !ok || ct.TableSchema == nil || len(ct.TableSchema.Columns) != 1 {
+		return s, false
+	}
+	cd, ok := ct.TableSchema.Columns[0].(*chparser.ColumnDef)
+	if !ok || cd.Type == nil || !isBareColumnType(cd) {
+		return s, false
+	}
+	canonicalizeJSONOptions(cd.Type)
+	return formatNode(cd.Type), true
+}
+
+// isBareColumnType reports whether the parsed column carries a type and
+// nothing else. A `type` that smuggles in a modifier — `type = "UInt64
+// CODEC(ZSTD(1))"` — parses fine, but rendering only the type node would drop
+// the modifier from the generated DDL. Those are kept verbatim instead, exactly
+// like a type the parser cannot read.
+func isBareColumnType(cd *chparser.ColumnDef) bool {
+	return cd.NotNull == nil && cd.Nullable == nil &&
+		cd.DefaultExpr == nil && cd.MaterializedExpr == nil &&
+		!cd.IsEphemeral && cd.EphemeralExpr == nil && cd.AliasExpr == nil &&
+		cd.Codec == nil && cd.TTL == nil &&
+		cd.Comment == nil && cd.CompressionCodec == nil
+}
+
+// jsonOptionRank groups a JSON option the way the parser's printer does:
+// max_dynamic_* parameters first, then typed-path hints, then SKIP /
+// SKIP REGEXP. The printer applies this grouping itself; ranking here keeps the
+// sort below in step with it so sorting never fights the printer.
+func jsonOptionRank(o *chparser.JSONOption) int {
+	switch {
+	case o.MaxDynamicPaths != nil || o.MaxDynamicTypes != nil:
+		return 0
+	case o.Column != nil:
+		return 1
+	case o.SkipPath != nil || o.SkipRegex != nil:
+		return 2
+	default:
+		return 0
+	}
+}
+
+// jsonOptionSorter puts every JSON type's options into one canonical order.
+// A JSON type's typed-path hints, SKIP paths and max_dynamic_* parameters are a
+// set: `JSON(b String, a String)` and `JSON(a String, b String)` describe the
+// same type, so the order they were written in must not read as drift. Options
+// are ordered by group and then by their rendered text.
+//
+// The order chosen does not have to match what ClickHouse prints, because both
+// the authored type and the introspected one pass through here before they meet
+// in the diff.
+type jsonOptionSorter struct {
+	chparser.DefaultASTVisitor
+}
+
+func (v *jsonOptionSorter) Enter(e chparser.Expr) {
+	j, ok := e.(*chparser.JSONType)
+	if !ok || j.Options == nil {
+		return
+	}
+	sort.SliceStable(j.Options.Items, func(a, b int) bool {
+		x, y := j.Options.Items[a], j.Options.Items[b]
+		if rx, ry := jsonOptionRank(x), jsonOptionRank(y); rx != ry {
+			return rx < ry
+		}
+		return x.String() < y.String()
+	})
+	// The default walk stops at a JSON type's name, so the type of each hint is
+	// descended into here: a JSON nested inside a hint needs the same treatment
+	// as one at the top level.
+	for _, item := range j.Options.Items {
+		if item.Column != nil && item.Column.Type != nil {
+			_ = item.Column.Type.Accept(v.Self)
+		}
+	}
+}
+
+// canonicalizeJSONOptions sorts the options of every JSON type in t, including
+// those nested inside Array / Map / Tuple / Nested parameters. The AST is
+// always a throwaway parse here, so mutating it is safe.
+func canonicalizeJSONOptions(t chparser.Expr) {
+	v := &jsonOptionSorter{}
+	v.Self = v
+	_ = t.Accept(v)
+}
+
+// normalizeColumnTypePtr canonicalizes an optional type string in place,
+// leaving it untouched when unset or unparseable.
+func normalizeColumnTypePtr(p **string) {
+	if *p == nil {
+		return
+	}
+	if nt, ok := normalizeColumnType(**p); ok {
+		*p = &nt
+	}
+}
+
 // normalizeTTL canonicalizes a table TTL clause to the same text introspection
 // renders (formatTTLItems), so an authored TTL and its live-introspected
 // counterpart compare equal. A stored TTL is rewritten by ClickHouse — INTERVAL
@@ -208,6 +323,19 @@ func canonicalize(db *DatabaseSpec) {
 		normalizePatchColumnExprs(t.ColumnPatches)
 		normalizeIndexExprs(t.Indexes)
 		normalizeTTLPtr(&t.TTL)
+	}
+	// A materialized view's explicit column list is diffed like a table's, so
+	// its types and expressions need the same canonical form.
+	for vi := range db.MaterializedViews {
+		normalizeColumnExprs(db.MaterializedViews[vi].Columns)
+	}
+	for di := range db.Dictionaries {
+		attrs := db.Dictionaries[di].Attributes
+		for ai := range attrs {
+			if nt, ok := normalizeColumnType(attrs[ai].Type); ok {
+				attrs[ai].Type = nt
+			}
+		}
 	}
 	// Patch fields land verbatim on their targets at resolution, so they
 	// must be canonicalized exactly like declared fields — otherwise a
@@ -259,11 +387,14 @@ func canonicalize(db *DatabaseSpec) {
 	}
 }
 
-// normalizeColumnExprs canonicalizes the expression-bearing fields of each
-// column in place.
+// normalizeColumnExprs canonicalizes the type and the expression-bearing
+// fields of each column in place.
 func normalizeColumnExprs(cols []ColumnSpec) {
 	for ci := range cols {
 		c := &cols[ci]
+		if nt, ok := normalizeColumnType(c.Type); ok {
+			c.Type = nt
+		}
 		normalizeExprPtr(&c.Default)
 		normalizeExprPtr(&c.Materialized)
 		normalizeExprPtr(&c.Alias)
@@ -276,6 +407,7 @@ func normalizeColumnExprs(cols []ColumnSpec) {
 func normalizePatchColumnExprs(patches []PatchColumnSpec) {
 	for i := range patches {
 		p := &patches[i]
+		normalizeColumnTypePtr(&p.Type)
 		normalizeExprPtr(&p.Default)
 		normalizeExprPtr(&p.Materialized)
 		normalizeExprPtr(&p.Alias)
