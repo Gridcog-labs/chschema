@@ -117,6 +117,43 @@ The `justfile` has the full recipe list.
 - ✅ `column` blocks: `nullable`, `default` / `materialized` /
   `ephemeral` / `alias` (mutually exclusive), `codec`, `ttl`,
   `comment`, `renamed_from` (drives `RENAME COLUMN` in the diff)
+- ✅ A column `type` is canonicalized on load and on introspect, like every
+  other expression-shaped field. Two rules: layout (`Map(String,   String)`,
+  `Decimal( 18 , 4 )`), and argument order wherever the type constructor is
+  order-insensitive — JSON options, `Variant` elements, enum elements — nested
+  types included. Respacing or reordering such a type is therefore not drift and
+  no longer emits a no-op `MODIFY COLUMN`
+- ✅ The ordering rule **reproduces ClickHouse's type identity exactly, with no
+  exceptions**: every list reordered is one the server reorders when it names
+  the type (JSON typed paths/skip paths held in hash containers,
+  `Variant(T1,T2)=Variant(T2,T1)` sorted by `DataTypeVariant`'s constructor,
+  enum sorted by value by `EnumValues`). Nothing the server leaves in authored
+  order is sorted — notably `SKIP REGEXP` — so hclexp never calls two types the
+  server names differently equal. Positional lists (`Tuple`, `Nested`, `Map`
+  key/value, `Decimal` params, `AggregateFunction` args) are untouched. Because
+  every such list is a set, the canonical form is also version-independent,
+  which it must be: a fleet runs several versions at once and `drift` compares
+  dump files with no server attached, so a version-keyed canonical form would
+  make two nodes' dumps incomparable. Under-normalizing costs a false positive
+  an author can settle by matching the server's spelling (though the interim DDL
+  contains a real `MODIFY COLUMN`, and `drift` has no HCL to reword);
+  over-normalizing would make hclexp disagree with `SHOW CREATE TABLE`
+- ✅ Kept verbatim: an unparseable type, an enum with implicit values, and a
+  `type` carrying a column modifier (`type = "UInt64 CODEC(ZSTD(1))"`). That
+  last one guards an artefact of the normalizer, not an HCL feature: the parser
+  exports no bare-type entry point, so the type is interpolated into a synthetic
+  column position where the grammar reads anything trailing as a modifier on
+  that column — rendering the type node alone would drop it, and `columnDefSQL`
+  interpolates the type verbatim, so such a value did produce working DDL.
+  `isBareColumnType` requires a type and nothing else. Each case warns once per
+  distinct type with the reason, since the symptom is a column that diffs
+  forever. Applies to
+  `patch_table` columns, `patch_column`, MV columns and dictionary attributes.
+  Two tests hold the assumptions: a live one (CI `test-live`, one table per type,
+  skipping types the server rejects) asserting the canonicalized authored type
+  equals the introspected type, so a ClickHouse upgrade that renames types fails
+  on the bump; and a layout-only corpus asserting normalization never changes
+  content, so a lossy SQL-parser release can't quietly alter generated DDL
 - ✅ `index` blocks; adding an index to an existing table also generates a
   `MATERIALIZE INDEX` marked manual (`-- MANUAL:` in `diff -sql`,
   `"manual": true` in JSON/plan) — heavy mutations are operator-run, never

@@ -2,7 +2,10 @@ package hcl
 
 import (
 	"log/slog"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	chparser "github.com/orian/clickhouse-sql-parser/parser"
 )
@@ -160,6 +163,235 @@ func normalizeExpr(s string) (string, bool) {
 	return formatNode(unwrapRootParens(sel.SelectItems[0].Expr)), true
 }
 
+// normalizeColumnType canonicalizes a column type to the text the parser's
+// printer emits — the same rendering introspection produces in columnFromAST —
+// so two spellings of one type compare equal instead of generating a no-op
+// ALTER TABLE ... MODIFY COLUMN. It covers whitespace and punctuation
+// (`Map(String,   String)`, `Decimal( 18 , 4 )`) and, via
+// canonicalizeTypeOrder, the argument order of every order-insensitive type
+// constructor (JSON options, Variant elements, enum elements). The
+// type is parsed inside a throwaway CREATE TABLE because the grammar accepts a
+// type only in a column position. Returns ok=false with the input unchanged
+// when it can't be parsed, so the caller keeps the raw text.
+func normalizeColumnType(s string) (string, bool) {
+	if strings.TrimSpace(s) == "" {
+		return s, true
+	}
+	stmt, err := parseCreateStatement("CREATE TABLE _norm_type (_c " + s + ") ENGINE = MergeTree ORDER BY tuple()")
+	if err != nil {
+		warnUncanonicalType(s, "the SQL parser cannot read it")
+		return s, false
+	}
+	ct, ok := stmt.(*chparser.CreateTable)
+	if !ok || ct.TableSchema == nil || len(ct.TableSchema.Columns) != 1 {
+		warnUncanonicalType(s, "it did not parse as a single column type")
+		return s, false
+	}
+	cd, ok := ct.TableSchema.Columns[0].(*chparser.ColumnDef)
+	if !ok || cd.Type == nil {
+		warnUncanonicalType(s, "it did not parse as a single column type")
+		return s, false
+	}
+	if !isBareColumnType(cd) {
+		warnUncanonicalType(s, "it carries a column modifier; prefer the dedicated attribute (codec / default / ttl / comment)")
+		return s, false
+	}
+	canonicalizeTypeOrder(cd.Type)
+	return formatNode(cd.Type), true
+}
+
+// isBareColumnType reports whether the parsed column carries a type and nothing
+// else.
+//
+// This guards a hazard created by the wrapping above, not an HCL feature. The
+// parser exports no way to parse a bare type — `parseColumnType` is unexported,
+// `ParseStmts` is all there is — so the type has to be interpolated into a
+// synthetic column position, and in that position the grammar happily reads
+// anything trailing as a *modifier on the synthetic column* rather than as part
+// of the type. `type = "UInt64 CODEC(ZSTD(1))"` parses as
+// ColumnDef{Type: UInt64, Codec: ZSTD(1)}, so rendering cd.Type alone would
+// silently drop the codec.
+//
+// Nobody should write that — `codec`, `default`, `ttl` and `comment` are
+// first-class column attributes — but columnDefSQL interpolates the type
+// verbatim into the column position, so such a value did produce the DDL its
+// author meant. Canonicalizing it would break a schema that worked, so the raw
+// text stands (and warns).
+func isBareColumnType(cd *chparser.ColumnDef) bool {
+	return cd.NotNull == nil && cd.Nullable == nil &&
+		cd.DefaultExpr == nil && cd.MaterializedExpr == nil &&
+		!cd.IsEphemeral && cd.EphemeralExpr == nil && cd.AliasExpr == nil &&
+		cd.Codec == nil && cd.TTL == nil &&
+		cd.Comment == nil && cd.CompressionCodec == nil
+}
+
+// JSON option ranks, in the order ClickHouse's DataTypeObject::doGetName emits
+// them: max_dynamic_types, max_dynamic_paths, typed-path hints, SKIP paths,
+// SKIP REGEXP. The parser's printer groups the three coarse kinds itself
+// (parameters, hints, skips), so these finer ranks refine that grouping rather
+// than fight it.
+const (
+	rankMaxDynamicTypes = iota
+	rankMaxDynamicPaths
+	rankTypeHint
+	rankSkipPath
+	rankSkipRegexp
+)
+
+func jsonOptionRank(o *chparser.JSONOption) int {
+	switch {
+	case o.MaxDynamicTypes != nil:
+		return rankMaxDynamicTypes
+	case o.MaxDynamicPaths != nil:
+		return rankMaxDynamicPaths
+	case o.Column != nil:
+		return rankTypeHint
+	case o.SkipPath != nil:
+		return rankSkipPath
+	case o.SkipRegex != nil:
+		return rankSkipRegexp
+	default:
+		return rankMaxDynamicTypes
+	}
+}
+
+// canonicalizeTypeOrder puts the arguments of every order-insensitive type
+// constructor in t into one order, depth-first so a nested type is canonical
+// before it is used as a sort key. The AST is always a throwaway parse here, so
+// mutating it is safe.
+//
+// The rule is to reproduce ClickHouse's own type identity exactly, with no
+// exceptions: every list reordered here is one ClickHouse itself reorders when
+// it names the type, because it holds it as a set or a map. That is also what
+// makes the canonical form version-independent — a set cannot carry meaning in
+// its order, so no version can disagree — which matters because a fleet runs
+// several versions at once and a dump is compared long after its connection
+// closed. Positional argument lists (`Tuple`, `Nested`, `Map` key/value,
+// `Decimal` precision/scale) are never touched, and neither is anything the
+// server leaves in authored order.
+func canonicalizeTypeOrder(t chparser.Expr) {
+	switch n := t.(type) {
+	case *chparser.JSONType:
+		if n.Options == nil {
+			return
+		}
+		for _, item := range n.Options.Items {
+			if item.Column != nil && item.Column.Type != nil {
+				canonicalizeTypeOrder(item.Column.Type)
+			}
+		}
+		sortJSONOptions(n.Options)
+	case *chparser.ComplexType:
+		for _, p := range n.Params {
+			canonicalizeTypeOrder(p)
+		}
+		// Variant is a set of types — the ClickHouse docs state
+		// `Variant(T1, T2) = Variant(T2, T1)`, and the DataTypeVariant
+		// constructor sorts by type name to enforce it — so an authored order
+		// must not diff against the server's.
+		if n.Name != nil && strings.EqualFold(n.Name.Name, "Variant") {
+			sort.SliceStable(n.Params, func(a, b int) bool {
+				return formatNode(n.Params[a]) < formatNode(n.Params[b])
+			})
+		}
+	case *chparser.NestedType:
+		// Nested/Tuple element order is positional; only descend.
+		for _, c := range n.Columns {
+			canonicalizeTypeOrder(c)
+		}
+	case *chparser.ColumnDef:
+		if n.Type != nil {
+			canonicalizeTypeOrder(n.Type)
+		}
+	case *chparser.EnumType:
+		sortEnumValues(n)
+	}
+}
+
+// sortJSONOptions orders a JSON type's options as ClickHouse names them:
+// max_dynamic_types, max_dynamic_paths, typed-path hints, SKIP paths, then
+// SKIP REGEXP. Hints and SKIP paths are sorted because ClickHouse sorts them —
+// it holds them in a hash map and a hash set, so it cannot name the type
+// otherwise.
+//
+// SKIP REGEXP keeps its authored order, because DataTypeObject::doGetName prints
+// path_regexps_to_skip in insertion order: two orderings are two type names to
+// the server. Sorting them would be the only place the canonical form claims two
+// distinct server types are one, and it would buy little — see the plan doc on
+// why a mismatch here is a false positive an author can fix, not a silent wrong
+// answer.
+func sortJSONOptions(opts *chparser.JSONOptions) {
+	sort.SliceStable(opts.Items, func(a, b int) bool {
+		x, y := opts.Items[a], opts.Items[b]
+		rx, ry := jsonOptionRank(x), jsonOptionRank(y)
+		if rx != ry {
+			return rx < ry
+		}
+		if rx == rankSkipRegexp {
+			return false // ClickHouse does not sort these; neither do we
+		}
+		return x.String() < y.String()
+	})
+}
+
+// sortEnumValues orders an enum's elements by value, as ClickHouse does: the
+// EnumValues constructor sorts by numeric value, so `Enum8('b' = 2, 'a' = 1)`
+// is named `Enum8('a' = 1, 'b' = 2)` whatever order it was declared in.
+//
+// Sorting by value, never by name, is what makes this safe. An element with an
+// implicit value takes its number from its position, so the two cannot be
+// separated; an enum with any implicit element is left untouched rather than
+// risk renumbering it.
+func sortEnumValues(e *chparser.EnumType) {
+	nums := make([]int64, len(e.Values))
+	for i, v := range e.Values {
+		if v.Value == nil {
+			return
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(formatNode(v.Value)), 10, 64)
+		if err != nil {
+			return
+		}
+		nums[i] = n
+	}
+	idx := make([]int, len(e.Values))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return nums[idx[a]] < nums[idx[b]] })
+	sorted := make([]chparser.EnumValue, len(e.Values))
+	for i, j := range idx {
+		sorted[i] = e.Values[j]
+	}
+	e.Values = sorted
+}
+
+// normalizeColumnTypePtr canonicalizes an optional type string in place,
+// leaving it untouched when unset or unparseable.
+func normalizeColumnTypePtr(p **string) {
+	if *p == nil {
+		return
+	}
+	if nt, ok := normalizeColumnType(**p); ok {
+		*p = &nt
+	}
+}
+
+// uncanonicalTypes remembers which type strings have already been reported, so
+// one unreadable type used across a hundred tables warns once per run.
+var uncanonicalTypes sync.Map
+
+// warnUncanonicalType reports a type that could not be reduced to canonical
+// form, and why. Without this the degradation is silent, and the symptom — that
+// column diffing forever on a spelling difference — has no visible cause. The
+// type string is the searchable key, so no table context is threaded in.
+func warnUncanonicalType(typ, reason string) {
+	if _, seen := uncanonicalTypes.LoadOrStore(typ, struct{}{}); seen {
+		return
+	}
+	slog.Warn("column type kept raw, so it may diff as drift", "type", typ, "reason", reason)
+}
+
 // normalizeTTL canonicalizes a table TTL clause to the same text introspection
 // renders (formatTTLItems), so an authored TTL and its live-introspected
 // counterpart compare equal. A stored TTL is rewritten by ClickHouse — INTERVAL
@@ -208,6 +440,19 @@ func canonicalize(db *DatabaseSpec) {
 		normalizePatchColumnExprs(t.ColumnPatches)
 		normalizeIndexExprs(t.Indexes)
 		normalizeTTLPtr(&t.TTL)
+	}
+	// A materialized view's explicit column list is diffed like a table's, so
+	// its types and expressions need the same canonical form.
+	for vi := range db.MaterializedViews {
+		normalizeColumnExprs(db.MaterializedViews[vi].Columns)
+	}
+	for di := range db.Dictionaries {
+		attrs := db.Dictionaries[di].Attributes
+		for ai := range attrs {
+			if nt, ok := normalizeColumnType(attrs[ai].Type); ok {
+				attrs[ai].Type = nt
+			}
+		}
 	}
 	// Patch fields land verbatim on their targets at resolution, so they
 	// must be canonicalized exactly like declared fields — otherwise a
@@ -259,11 +504,14 @@ func canonicalize(db *DatabaseSpec) {
 	}
 }
 
-// normalizeColumnExprs canonicalizes the expression-bearing fields of each
-// column in place.
+// normalizeColumnExprs canonicalizes the type and the expression-bearing
+// fields of each column in place.
 func normalizeColumnExprs(cols []ColumnSpec) {
 	for ci := range cols {
 		c := &cols[ci]
+		if nt, ok := normalizeColumnType(c.Type); ok {
+			c.Type = nt
+		}
 		normalizeExprPtr(&c.Default)
 		normalizeExprPtr(&c.Materialized)
 		normalizeExprPtr(&c.Alias)
@@ -276,6 +524,7 @@ func normalizeColumnExprs(cols []ColumnSpec) {
 func normalizePatchColumnExprs(patches []PatchColumnSpec) {
 	for i := range patches {
 		p := &patches[i]
+		normalizeColumnTypePtr(&p.Type)
 		normalizeExprPtr(&p.Default)
 		normalizeExprPtr(&p.Materialized)
 		normalizeExprPtr(&p.Alias)

@@ -118,6 +118,49 @@ column "name" {
 of `default`, `materialized`, `ephemeral`, or `alias`; it may also carry
 `codec`, `ttl`, `comment`, and `renamed_from`.
 
+### Type canonicalization
+
+A `type` is parsed and rendered to one canonical form on both load and
+introspection, so how it is written never reads as drift. Two things are
+normalized:
+
+- **Layout** — whitespace and punctuation inside the type.
+  `Map(String,   String)`, `Decimal( 18 , 4 )` and `Enum8('a' = 1)` resolve to
+  `Map(String, String)`, `Decimal(18, 4)` and `Enum8('a'=1)`.
+- **Argument order, where the type constructor is order-insensitive.**
+  `JSON(b String, a String)`, `Variant(UInt64, String)` and
+  `Enum8('b' = 2, 'a' = 1)` resolve to `JSON(a String, b String)`,
+  `Variant(String, UInt64)` and `Enum8('a'=1, 'b'=2)`. Nested types are covered,
+  such as `Array(JSON(…))` and `Map(String, Variant(…))`.
+
+Without this, editing only the spelling of a type produced an
+`ALTER TABLE … MODIFY COLUMN` that rewrote the column to what it already was.
+
+Every list reordered above is one ClickHouse itself reorders when it names the
+type: typed JSON paths are a hash map and skip paths a hash set, `Variant(T1,
+T2)` and `Variant(T2, T1)` are documented as one type, and an enum is a set of
+(name, value) pairs sorted by value. The canonical form reproduces ClickHouse's
+type identity and never claims two types the server names differently are one.
+That also makes it version-independent — a set cannot carry meaning in its
+order, so no version can disagree — which matters because a fleet runs several
+ClickHouse versions at once.
+
+Anything the server leaves in authored order is left alone here too, so it still
+compares exactly — including `SKIP REGEXP`, which ClickHouse prints in insertion
+order. So is anything positional:
+
+- element order inside a `Tuple` or `Nested`, a `Map`'s key and value, a
+  `Decimal`'s precision and scale, an `AggregateFunction`'s argument types;
+- an enum with any implicit element (`Enum8('a', 'b')`), because an implicit
+  element takes its number from its position;
+- a `max_dynamic_*` parameter written at its default value, because ClickHouse
+  omits a default from the type name and the defaults are version-specific
+  constants.
+
+The same canonicalization runs on `patch_table` columns, `patch_column`,
+materialized-view columns, and dictionary attributes. A type the SQL parser
+cannot read is kept verbatim, so it may still diff as drift.
+
 ## `patch_column`
 
 Inside a table with `extend`, `patch_column` partially specializes one column
