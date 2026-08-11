@@ -141,24 +141,21 @@ func TestNormalizeColumnType_ChangesLayoutOnly(t *testing.T) {
 	}
 }
 
-// TestNormalizeColumnType_SortsSkipRegexp covers the one place this
-// canonicalizes further than ClickHouse's own type name.
-// DataTypeObject::doGetName prints path_regexps_to_skip in insertion order, so
-// two orderings are two names to the server. They are sorted here anyway,
-// because a list of patterns to ignore is semantically a set — no version can
-// read meaning into its order — and a canonical form that holds across versions
-// is what stops a mixed-version fleet manufacturing drift. See the plan doc.
-func TestNormalizeColumnType_SortsSkipRegexp(t *testing.T) {
+// TestNormalizeColumnType_KeepsSkipRegexpOrder holds the no-exceptions rule: the
+// canonical form reproduces ClickHouse's type identity and never claims two
+// distinct server types are one. DataTypeObject::doGetName prints
+// path_regexps_to_skip in insertion order, so two orderings are two type names
+// and both must survive here. A reordered SKIP REGEXP therefore still shows in a
+// diff — a false positive an author can settle by matching the server's
+// spelling, which is a better failure than hclexp quietly disagreeing with
+// SHOW CREATE TABLE.
+func TestNormalizeColumnType_KeepsSkipRegexpOrder(t *testing.T) {
 	got, ok := normalizeColumnType("JSON(SKIP REGEXP '^b', SKIP REGEXP '^a')")
 	require.True(t, ok)
 	assert.Less(t,
-		strings.Index(got, "SKIP REGEXP '^a'"),
 		strings.Index(got, "SKIP REGEXP '^b'"),
-		"SKIP REGEXP is sorted: %s", got)
-
-	reversed, ok := normalizeColumnType("JSON(SKIP REGEXP '^a', SKIP REGEXP '^b')")
-	require.True(t, ok)
-	assert.Equal(t, got, reversed, "either authored order must reduce to one form")
+		strings.Index(got, "SKIP REGEXP '^a'"),
+		"SKIP REGEXP order is preserved, not sorted: %s", got)
 }
 
 // TestNormalizeColumnType_KeepsSmuggledModifiers guards the one way this could

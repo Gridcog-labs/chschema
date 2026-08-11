@@ -136,14 +136,18 @@ normalized:
 Without this, editing only the spelling of a type produced an
 `ALTER TABLE … MODIFY COLUMN` that rewrote the column to what it already was.
 
-The second rule is semantic, not a copy of one ClickHouse version's output. A
-JSON type's typed paths are a map and its skip paths a set; `Variant(T1, T2)`
-and `Variant(T2, T1)` are documented as the same type; an enum is a set of
-(name, value) pairs. Reordering any of them cannot change storage or query
-results on *any* version, which is what makes the canonical form safe across a
-fleet running several ClickHouse versions at once.
+Every list reordered above is one ClickHouse itself reorders when it names the
+type: typed JSON paths are a hash map and skip paths a hash set, `Variant(T1,
+T2)` and `Variant(T2, T1)` are documented as one type, and an enum is a set of
+(name, value) pairs sorted by value. The canonical form reproduces ClickHouse's
+type identity and never claims two types the server names differently are one.
+That also makes it version-independent — a set cannot carry meaning in its
+order, so no version can disagree — which matters because a fleet runs several
+ClickHouse versions at once.
 
-Anything positional is left alone, so it still compares exactly:
+Anything the server leaves in authored order is left alone here too, so it still
+compares exactly — including `SKIP REGEXP`, which ClickHouse prints in insertion
+order. So is anything positional:
 
 - element order inside a `Tuple` or `Nested`, a `Map`'s key and value, a
   `Decimal`'s precision and scale, an `AggregateFunction`'s argument types;

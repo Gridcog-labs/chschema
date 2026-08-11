@@ -103,31 +103,55 @@ Applying that rule turned up two cases where hclexp was *weaker* than every
 ClickHouse: `Variant(UInt64, String)` and `Enum8('b' = 2, 'a' = 1)` both
 diffed forever against the server's own spelling. Both are now canonical.
 
-It also reverses one earlier decision. `SKIP REGEXP` is sorted, even though
-`doGetName` prints `path_regexps_to_skip` in insertion order, because a list
-of patterns to ignore is a set: a path is skipped if any pattern matches, so
-order has no meaning, and two nodes differing only in that order behave
-identically. Sorting it is deliberately stronger than one version's type
-name, and it is the only place that is true. The trade is explicit — an
-operator comparing `SHOW CREATE TABLE` by eye would see a difference hclexp
-calls equal — and it buys immunity from a version that decides to sort them.
+`SKIP REGEXP` is the one order-insensitive-looking list left alone.
+`doGetName` prints `path_regexps_to_skip` in insertion order, so two
+orderings are two type names to the server, and reordering them would be the
+only place the canonical form claims two distinct server types are one. See
+*What each direction actually costs* for why that trade is not worth making.
 
-### Which direction is harmful
+### What each direction actually costs
 
-The two directions of divergence are not symmetrical.
+Calling under-normalization a bug overstates it. Sorted honestly:
 
-**Normalizing less than a server in the fleet** is the bug. That server
-reports a form we do not produce, the authored type never matches it, and
-every schema carrying that type diffs forever.
+**Normalizing less than the server** produces a false positive. The
+authored type never matches the introspected one, so the column shows a
+change on every run and `diff -sql` emits an `ALTER TABLE … MODIFY COLUMN`
+that rewrites the column to what it already is. In the ordinary case an
+author fixes it in a minute by spelling the type the way the server does —
+or never meets it at all, having dumped the schema from a cluster to begin
+with. So it is an inconvenience with a manual remedy, not a wrong answer.
 
-**Normalizing more than a server in the fleet** is benign. Both the
-authored and the introspected type pass through our canonicalizer, so they
-still match; version skew is absorbed rather than reported. The cost is a
-cosmetic false negative on a difference that cannot affect behaviour.
+Two things make it worth fixing anyway, and neither is severity:
 
-So the bias is deliberate: where a constructor is order-insensitive, being
-stronger than the weakest version in the fleet is what keeps a mixed-version
-estate quiet.
+- Until it is fixed the generated DDL contains a real mutation. On a large
+  table that is expensive, and in a pipeline that applies generated SQL it
+  is executed rather than read.
+- It is a trap that recurs. It cannot be fixed once; it returns for every
+  new author, table and column that spells the type naturally.
+
+And two places have no manual remedy:
+
+- `drift` compares machine-generated dumps. There is no HCL to reword, so a
+  naming difference between two nodes is reported and cannot be settled —
+  and drift exits non-zero as a CI guard, so the choice becomes a
+  permanently red build or a suppression that hides real drift.
+- If two versions in the fleet name one type differently, no single
+  authored spelling satisfies both: fixing one environment breaks the other.
+  This is the only true bug in the class, and the clearest example of it is
+  the `max_dynamic_*` default handling this change leaves out of scope.
+
+**Normalizing more than the server** produces a false negative: hclexp says
+two types are equal where `SHOW CREATE TABLE` shows different names. Version
+skew gets absorbed rather than reported, which is convenient, but the tool
+now disagrees with the server about type identity.
+
+**The resolution is to match the server exactly, with no exceptions.** Every
+list reordered here is one ClickHouse itself reorders. Nothing is sorted
+that the server leaves alone — notably `SKIP REGEXP`, which was sorted in an
+earlier revision of this change and is not any more. An exception-free rule
+is worth more than the marginal robustness of pre-empting a version that
+might one day sort something: the rule states in one line, one test checks
+it, and if a version does move, that test says so and we follow.
 
 `TestCHLive_ColumnTypeCanonicalFormMatchesServer` guards the harmful
 direction in CI. The `test-live` job runs the live suite against the

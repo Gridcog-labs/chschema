@@ -241,13 +241,15 @@ func jsonOptionRank(o *chparser.JSONOption) int {
 // before it is used as a sort key. The AST is always a throwaway parse here, so
 // mutating it is safe.
 //
-// The rule is semantic, not a copy of one server's printer: an argument list
-// that ClickHouse holds as a set or a map cannot carry meaning in its order, so
-// every version must agree that reordering it yields the same type. That makes
-// this normalization version-independent, which matters because a fleet can run
-// several ClickHouse versions at once — see the plan doc. Positional argument
-// lists (`Tuple`, `Nested`, `Map` key/value, `Decimal` precision/scale) are
-// never touched.
+// The rule is to reproduce ClickHouse's own type identity exactly, with no
+// exceptions: every list reordered here is one ClickHouse itself reorders when
+// it names the type, because it holds it as a set or a map. That is also what
+// makes the canonical form version-independent — a set cannot carry meaning in
+// its order, so no version can disagree — which matters because a fleet runs
+// several versions at once and a dump is compared long after its connection
+// closed. Positional argument lists (`Tuple`, `Nested`, `Map` key/value,
+// `Decimal` precision/scale) are never touched, and neither is anything the
+// server leaves in authored order.
 func canonicalizeTypeOrder(t chparser.Expr) {
 	switch n := t.(type) {
 	case *chparser.JSONType:
@@ -289,16 +291,25 @@ func canonicalizeTypeOrder(t chparser.Expr) {
 
 // sortJSONOptions orders a JSON type's options as ClickHouse names them:
 // max_dynamic_types, max_dynamic_paths, typed-path hints, SKIP paths, then
-// SKIP REGEXP. Hints and SKIP paths are sorted because ClickHouse holds them in
-// a hash map and a hash set respectively, so no version can read meaning into
-// their order. SKIP REGEXP is sorted for the same semantic reason — a list of
-// patterns to ignore is a set — even though DataTypeObject::doGetName happens to
-// print it in insertion order today.
+// SKIP REGEXP. Hints and SKIP paths are sorted because ClickHouse sorts them —
+// it holds them in a hash map and a hash set, so it cannot name the type
+// otherwise.
+//
+// SKIP REGEXP keeps its authored order, because DataTypeObject::doGetName prints
+// path_regexps_to_skip in insertion order: two orderings are two type names to
+// the server. Sorting them would be the only place the canonical form claims two
+// distinct server types are one, and it would buy little — see the plan doc on
+// why a mismatch here is a false positive an author can fix, not a silent wrong
+// answer.
 func sortJSONOptions(opts *chparser.JSONOptions) {
 	sort.SliceStable(opts.Items, func(a, b int) bool {
 		x, y := opts.Items[a], opts.Items[b]
-		if rx, ry := jsonOptionRank(x), jsonOptionRank(y); rx != ry {
+		rx, ry := jsonOptionRank(x), jsonOptionRank(y)
+		if rx != ry {
 			return rx < ry
+		}
+		if rx == rankSkipRegexp {
+			return false // ClickHouse does not sort these; neither do we
 		}
 		return x.String() < y.String()
 	})

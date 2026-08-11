@@ -123,18 +123,21 @@ The `justfile` has the full recipe list.
   order-insensitive — JSON options, `Variant` elements, enum elements — nested
   types included. Respacing or reordering such a type is therefore not drift and
   no longer emits a no-op `MODIFY COLUMN`
-- ✅ The ordering rule is **semantic, deliberately not a copy of one
-  ClickHouse version's printer**: a fleet runs several versions at once (Cloud
-  self-upgrades, clusters sit mid-upgrade, dev leads prod), and a dump is
-  compared long after its connection closed — `drift` compares two dump files
-  with no server attached — so the canonical form must be version-independent.
-  Ordering is normalized only where the constructor is a set or a map (JSON
-  typed paths/skip paths, `Variant(T1,T2)=Variant(T2,T1)`, enum by value), where
-  no version can read meaning into order. Positional lists (`Tuple`, `Nested`,
-  `Map` key/value, `Decimal` params, `AggregateFunction` args) are untouched.
-  Normalizing *less* than any server in the fleet is the harmful direction (that
-  type then diffs forever); normalizing *more* only absorbs skew, so the bias is
-  intentional — `SKIP REGEXP` is sorted even though `doGetName` does not sort it
+- ✅ The ordering rule **reproduces ClickHouse's type identity exactly, with no
+  exceptions**: every list reordered is one the server reorders when it names
+  the type (JSON typed paths/skip paths held in hash containers,
+  `Variant(T1,T2)=Variant(T2,T1)` sorted by `DataTypeVariant`'s constructor,
+  enum sorted by value by `EnumValues`). Nothing the server leaves in authored
+  order is sorted — notably `SKIP REGEXP` — so hclexp never calls two types the
+  server names differently equal. Positional lists (`Tuple`, `Nested`, `Map`
+  key/value, `Decimal` params, `AggregateFunction` args) are untouched. Because
+  every such list is a set, the canonical form is also version-independent,
+  which it must be: a fleet runs several versions at once and `drift` compares
+  dump files with no server attached, so a version-keyed canonical form would
+  make two nodes' dumps incomparable. Under-normalizing costs a false positive
+  an author can settle by matching the server's spelling (though the interim DDL
+  contains a real `MODIFY COLUMN`, and `drift` has no HCL to reword);
+  over-normalizing would make hclexp disagree with `SHOW CREATE TABLE`
 - ✅ An unparseable type, a `type` smuggling in a modifier, and an enum with
   implicit values are kept verbatim (unparseable ones warn once per distinct
   type, since the symptom is a column that diffs forever). Applies to
