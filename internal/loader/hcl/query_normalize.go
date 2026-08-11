@@ -203,32 +203,48 @@ func isBareColumnType(cd *chparser.ColumnDef) bool {
 		cd.Comment == nil && cd.CompressionCodec == nil
 }
 
-// jsonOptionRank groups a JSON option the way the parser's printer does:
-// max_dynamic_* parameters first, then typed-path hints, then SKIP /
-// SKIP REGEXP. The printer applies this grouping itself; ranking here keeps the
-// sort below in step with it so sorting never fights the printer.
+// JSON option ranks, in the order ClickHouse's DataTypeObject::doGetName emits
+// them: max_dynamic_types, max_dynamic_paths, typed-path hints, SKIP paths,
+// SKIP REGEXP. The parser's printer groups the three coarse kinds itself
+// (parameters, hints, skips), so these finer ranks refine that grouping rather
+// than fight it.
+const (
+	rankMaxDynamicTypes = iota
+	rankMaxDynamicPaths
+	rankTypeHint
+	rankSkipPath
+	rankSkipRegexp
+)
+
 func jsonOptionRank(o *chparser.JSONOption) int {
 	switch {
-	case o.MaxDynamicPaths != nil || o.MaxDynamicTypes != nil:
-		return 0
+	case o.MaxDynamicTypes != nil:
+		return rankMaxDynamicTypes
+	case o.MaxDynamicPaths != nil:
+		return rankMaxDynamicPaths
 	case o.Column != nil:
-		return 1
-	case o.SkipPath != nil || o.SkipRegex != nil:
-		return 2
+		return rankTypeHint
+	case o.SkipPath != nil:
+		return rankSkipPath
+	case o.SkipRegex != nil:
+		return rankSkipRegexp
 	default:
-		return 0
+		return rankMaxDynamicTypes
 	}
 }
 
-// jsonOptionSorter puts every JSON type's options into one canonical order.
-// A JSON type's typed-path hints, SKIP paths and max_dynamic_* parameters are a
-// set: `JSON(b String, a String)` and `JSON(a String, b String)` describe the
-// same type, so the order they were written in must not read as drift. Options
-// are ordered by group and then by their rendered text.
+// jsonOptionSorter puts every JSON type's options into the order ClickHouse
+// itself uses, and no stronger. ClickHouse holds a JSON type's typed paths in a
+// hash map and its skip paths in a hash set, so it has to sort both to name the
+// type at all: DataTypeObject::doGetName sorts `typed_paths` and
+// `paths_to_skip` alphabetically. `JSON(b String, a String)` and
+// `JSON(a String, b String)` are therefore one type to ClickHouse, and matching
+// that here is what stops a reordered hint list reading as drift.
 //
-// The order chosen does not have to match what ClickHouse prints, because both
-// the authored type and the introspected one pass through here before they meet
-// in the diff.
+// SKIP REGEXP is deliberately left in place: ClickHouse writes
+// `path_regexps_to_skip` in insertion order with no sort, so two orderings are
+// two type names to ClickHouse, and reordering them here would canonicalize
+// harder than the server does and hide a difference it can see.
 type jsonOptionSorter struct {
 	chparser.DefaultASTVisitor
 }
@@ -240,8 +256,12 @@ func (v *jsonOptionSorter) Enter(e chparser.Expr) {
 	}
 	sort.SliceStable(j.Options.Items, func(a, b int) bool {
 		x, y := j.Options.Items[a], j.Options.Items[b]
-		if rx, ry := jsonOptionRank(x), jsonOptionRank(y); rx != ry {
+		rx, ry := jsonOptionRank(x), jsonOptionRank(y)
+		if rx != ry {
 			return rx < ry
+		}
+		if rx == rankSkipRegexp {
+			return false // keep the authored order; ClickHouse does not sort these
 		}
 		return x.String() < y.String()
 	})

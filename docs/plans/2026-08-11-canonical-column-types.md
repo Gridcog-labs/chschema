@@ -39,17 +39,27 @@ rendering the type node alone would drop the modifier from the generated
 DDL, so `isBareColumnType` rejects it and the raw text stands.
 
 Before rendering, the type tree is walked and every `JSON` type's options
-are sorted into a fixed order: `max_dynamic_*` parameters, then typed-path
-hints, then `SKIP` / `SKIP REGEXP`, each group ordered by its rendered
-text. The parser's printer already groups the three kinds; only the order
-within a group is ours to fix. The walk descends through `Array`, `Map`,
-`Tuple` and `Nested` parameters, and through the type of each JSON hint,
-so a nested `Array(JSON(b String, a String))` canonicalizes too.
+are put into the order ClickHouse itself uses. The walk descends through
+`Array`, `Map`, `Tuple` and `Nested` parameters, and through the type of
+each JSON hint, so a nested `Array(JSON(b String, a String))`
+canonicalizes too.
 
-Sorting is safe here precisely because it is applied on both sides. The
-canonical order does not have to match what ClickHouse prints — an
-authored type and an introspected type both pass through this function
-before they meet in the diff.
+The ordering is copied from `DataTypeObject::doGetName`
+(`src/DataTypes/DataTypeObject.cpp`) rather than invented, on the rule that
+nothing should be canonicalized harder than the server does it — otherwise
+a difference ClickHouse can see would be hidden. What that source shows:
+
+- `typed_paths` is a hash map and `paths_to_skip` a hash set, so both are
+  `std::sort`ed before printing. ClickHouse has no choice: an unordered
+  container cannot produce a deterministic type name. Two hint orderings
+  are therefore one type to the server, and sorting here matches it.
+- `path_regexps_to_skip` is printed in insertion order with no sort, so
+  two `SKIP REGEXP` orderings are two type names. Ours are left in place.
+- Parameters come first, `max_dynamic_types` before `max_dynamic_paths`,
+  and each is omitted when it equals its default.
+
+The parser's printer groups options coarsely (parameters, hints, skips) on
+its own, so the ranks here refine that grouping rather than fight it.
 
 `canonicalize` then normalizes the type of every column it can reach:
 declared table columns, `patch_table` `column` / `modify_column`,
@@ -63,7 +73,16 @@ declared table columns.
 `Enum8('b' = 2, 'a' = 1)` is also order-independent when every element
 carries an explicit value, but reordering an enum whose values are
 implicit (`Enum8('a', 'b')`) silently renumbers it. The distinction is
-worth a separate change, not a rider on this one.
+worth a separate change, not a rider on this one. Worth checking first
+whether `DataTypeEnum`'s name generation sorts, as `DataTypeObject`'s does;
+if it sorts by value, an authored reorder currently diffs against the
+server and the same argument applies.
+
+A `max_dynamic_paths` or `max_dynamic_types` written at its default value
+also still diffs, because ClickHouse omits a default parameter from the
+type name entirely. Matching that means hardcoding the defaults (1024
+paths, 32 types at the time of writing), which are version-specific
+constants in the server, so it is left alone.
 
 ## Tests
 

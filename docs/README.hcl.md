@@ -127,15 +127,30 @@ normalized:
 - **Layout** — whitespace and punctuation inside the type.
   `Map(String,   String)`, `Decimal( 18 , 4 )` and `Enum8('a' = 1)` resolve to
   `Map(String, String)`, `Decimal(18, 4)` and `Enum8('a'=1)`.
-- **`JSON` option order** — a JSON type's typed-path hints, `SKIP` paths and
-  `max_dynamic_*` parameters are a set, so `JSON(b String, a String)` and
-  `JSON(a String, b String)` are the same type and resolve to one spelling
-  (parameters first, then hints, then skips, each ordered by name). This
-  applies to nested types too, such as `Array(JSON(...))`.
+- **`JSON` option order** — `JSON(b String, a String)` and
+  `JSON(a String, b String)` resolve to one spelling. This follows ClickHouse:
+  it holds a JSON type's typed paths in a hash map and its skip paths in a hash
+  set, so `DataTypeObject::doGetName` sorts both alphabetically to name the type
+  at all. The canonical order is the server's own —
+  `max_dynamic_types`, `max_dynamic_paths`, sorted typed-path hints, sorted
+  `SKIP` paths, then `SKIP REGEXP`. Nested types are covered too, such as
+  `Array(JSON(…))`.
 
 Without this, editing only the spelling of a type produced an
 `ALTER TABLE … MODIFY COLUMN` that rewrote the column to what it already was.
-Element order inside a `Tuple` or `Nested` is meaningful and is left alone.
+
+Nothing is canonicalized harder than ClickHouse does it, so a difference the
+server can see is never hidden:
+
+- element order inside a `Tuple` or `Nested` is positional, and is left alone;
+- `SKIP REGEXP` keeps its authored order — ClickHouse writes
+  `path_regexps_to_skip` in insertion order with no sort, so two orderings are
+  two types to the server;
+- `Enum8('b' = 2, 'a' = 1)` is left alone, so it still diffs against
+  `Enum8('a' = 1, 'b' = 2)`;
+- a `max_dynamic_*` parameter written at its default value still diffs, because
+  ClickHouse omits a default from the type name and the defaults are
+  version-specific.
 
 The same canonicalization runs on `patch_table` columns, `patch_column`,
 materialized-view columns, and dictionary attributes. A type the SQL parser

@@ -120,11 +120,16 @@ The `justfile` has the full recipe list.
 - ✅ A column `type` is canonicalized on load and on introspect, like every
   other expression-shaped field: layout (`Map(String,   String)`,
   `Decimal( 18 , 4 )`, `Enum8('a' = 1)`) and the order of the options inside a
-  `JSON` type (hints/SKIP/`max_dynamic_*` are a set), including nested types.
-  Reordering or respacing a type is therefore not drift and no longer emits a
-  no-op `MODIFY COLUMN`. `Tuple`/`Nested` element order stays meaningful; an
-  unparseable type is kept verbatim. Applies to `patch_table` columns,
-  `patch_column`, MV columns and dictionary attributes
+  `JSON` type, including nested ones. Reordering or respacing a type is
+  therefore not drift and no longer emits a no-op `MODIFY COLUMN`. The JSON
+  order is copied from ClickHouse's `DataTypeObject::doGetName` (which sorts
+  typed paths and SKIP paths because it holds them in hash containers), never
+  invented — nothing is canonicalized harder than the server does it, so
+  `SKIP REGEXP` order, `Tuple`/`Nested` element order, enum element order and a
+  `max_dynamic_*` set to its default all still compare as they do on the
+  server. An unparseable type, and a `type` smuggling in a modifier, are kept
+  verbatim. Applies to `patch_table` columns, `patch_column`, MV columns and
+  dictionary attributes
 - ✅ `index` blocks; adding an index to an existing table also generates a
   `MATERIALIZE INDEX` marked manual (`-- MANUAL:` in `diff -sql`,
   `"manual": true` in JSON/plan) — heavy mutations are operator-run, never

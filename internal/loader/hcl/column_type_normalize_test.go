@@ -27,6 +27,7 @@ func TestNormalizeColumnType_Canonicalizes(t *testing.T) {
 		{"json hints sorted", "JSON(b String, a String)", "JSON(a String, b String)"},
 		{"json already sorted", "JSON(a String, b String)", "JSON(a String, b String)"},
 		{"json params first", "JSON(b String, max_dynamic_paths=16, a String)", "JSON(max_dynamic_paths=16, a String, b String)"},
+		{"json param order matches clickhouse", "JSON(max_dynamic_paths=16, max_dynamic_types=8)", "JSON(max_dynamic_types=8, max_dynamic_paths=16)"},
 		{"json skip sorted", "JSON(SKIP z, a String, SKIP c)", "JSON(a String, SKIP c, SKIP z)"},
 		{"json nested in array", "Array(JSON(b String, a String))", "Array(JSON(a String, b String))"},
 		{"json nested in map value", "Map(String, JSON(b String, a String))", "Map(String, JSON(a String, b String))"},
@@ -51,6 +52,21 @@ func TestNormalizeColumnType_UnparseableKeepsRaw(t *testing.T) {
 	got, ok := normalizeColumnType(raw)
 	assert.False(t, ok)
 	assert.Equal(t, raw, got, "a type the parser cannot read is kept verbatim")
+}
+
+// TestNormalizeColumnType_KeepsSkipRegexpOrder pins the one JSON option
+// ClickHouse does not sort. DataTypeObject::doGetName sorts typed paths and SKIP
+// paths but writes path_regexps_to_skip in insertion order, so two orderings are
+// two type names to ClickHouse. Sorting them here would canonicalize harder than
+// the server does and hide a difference it can see.
+func TestNormalizeColumnType_KeepsSkipRegexpOrder(t *testing.T) {
+	got, ok := normalizeColumnType("JSON(SKIP REGEXP '^b', SKIP REGEXP '^a')")
+	require.True(t, ok)
+	assert.Contains(t, got, "SKIP REGEXP '^b'")
+	assert.Less(t,
+		strings.Index(got, "SKIP REGEXP '^b'"),
+		strings.Index(got, "SKIP REGEXP '^a'"),
+		"SKIP REGEXP order is preserved, not sorted")
 }
 
 // TestNormalizeColumnType_KeepsSmuggledModifiers guards the one way this could
