@@ -3,9 +3,9 @@ package hcl
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/posthog/chschema/test/testhelpers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,15 +17,19 @@ import (
 //
 // The rule the canonicalizer follows is that a type spelling must reduce to the
 // same string whether it was authored or read back from a cluster. This asserts
-// exactly that: each type is declared in one spelling, introspected, and the
-// introspected form is compared against the canonicalized *authored* form.
+// exactly that: each type is declared in a deliberately non-canonical spelling,
+// introspected, and the introspected form compared against the canonicalized
+// *authored* form.
 //
-// It is the direction that matters. If ClickHouse ever canonicalizes something
-// we leave alone — sorting SKIP REGEXP, say — the server's form and ours diverge
-// and every schema carrying that type diffs forever. That is the reported bug,
-// and this test fails first. The reverse (ClickHouse canonicalizing less than we
-// do) cannot cause phantom drift, because both sides pass through the same
-// function.
+// It is the direction that matters. If ClickHouse canonicalizes something we
+// leave alone, the server's form and ours diverge and every schema carrying that
+// type diffs forever — the reported bug, and this fails first. The reverse
+// (ClickHouse canonicalizing less than we do) cannot cause phantom drift,
+// because both sides pass through the same function.
+//
+// Each type gets its own table and a type the server rejects skips rather than
+// fails, so running against an older or newer ClickHouse reports "not
+// supported here" instead of a false alarm.
 func TestCHLive_ColumnTypeCanonicalFormMatchesServer(t *testing.T) {
 	if !*clickhouseLive {
 		t.Skip("pass -clickhouse to run against a live ClickHouse")
@@ -34,49 +38,66 @@ func TestCHLive_ColumnTypeCanonicalFormMatchesServer(t *testing.T) {
 	dbName := testhelpers.CreateTestDatabase(t, conn)
 	ctx := context.Background()
 
-	// Each authored spelling is deliberately not in canonical form: reordered
-	// JSON hints and skip paths, loose whitespace, spaced enum assignments.
+	// Settings retried with when a plain CREATE is rejected: some of these types
+	// are behind an experimental flag on some versions, and gone from behind it
+	// on others.
+	optIn := clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
+		"allow_experimental_variant_type": 1,
+		"enable_variant_type":             1,
+		"enable_json_type":                1,
+	}))
+
 	cases := []struct {
-		column   string
+		name     string
 		authored string
 	}{
-		{"c_map", "Map(String,   String)"},
-		{"c_decimal", "Decimal( 18 , 4 )"},
-		{"c_enum", "Enum8('b' = 2, 'a' = 1)"},
-		{"c_lc", "LowCardinality( Nullable( String ) )"},
-		{"c_tuple", "Tuple(b Int32, a String)"},
-		{"c_json_hints", "JSON(b String, a String)"},
-		{"c_json_skips", "JSON(SKIP z, b String, SKIP c, a String)"},
-		{"c_json_params", "JSON(max_dynamic_paths=16, max_dynamic_types=8, b String, a String)"},
-		{"c_json_regexp", "JSON(SKIP REGEXP '^b', SKIP REGEXP '^a')"},
-		{"c_json_nested", "Array(JSON(b String, a String))"},
-	}
-
-	cols := make([]string, 0, len(cases))
-	for _, c := range cases {
-		cols = append(cols, fmt.Sprintf("`%s` %s", c.column, c.authored))
-	}
-	stmt := fmt.Sprintf("CREATE TABLE %s.types (`id` UInt64, %s) ENGINE = MergeTree ORDER BY id",
-		dbName, strings.Join(cols, ", "))
-	require.NoError(t, conn.Exec(ctx, stmt), "DDL rejected:\n%s", stmt)
-
-	db, err := Introspect(ctx, conn, dbName, false)
-	require.NoError(t, err)
-	require.Len(t, db.Tables, 1)
-
-	byName := map[string]string{}
-	for _, c := range db.Tables[0].Columns {
-		byName[c.Name] = c.Type
+		{"map", "Map(String,   String)"},
+		{"decimal", "Decimal( 18 , 4 )"},
+		{"lowcardinality", "LowCardinality( Nullable( String ) )"},
+		{"tuple", "Tuple(b Int32, a String)"},
+		{"enum", "Enum8('b' = 2, 'a' = 1)"},
+		{"enum_implicit", "Enum8('b', 'a')"},
+		{"variant", "Variant(UInt64, String)"},
+		{"variant_nested", "Map(String, Variant(UInt64, String))"},
+		{"json_hints", "JSON(b String, a String)"},
+		{"json_skips", "JSON(SKIP z, b String, SKIP c, a String)"},
+		{"json_params", "JSON(max_dynamic_paths=16, max_dynamic_types=8, b String, a String)"},
+		{"json_regexp", "JSON(SKIP REGEXP '^b', SKIP REGEXP '^a')"},
+		{"json_nested", "Array(JSON(b String, a String))"},
 	}
 
 	for _, c := range cases {
-		t.Run(c.column, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
+			table := "t_" + c.name
+			stmt := fmt.Sprintf("CREATE TABLE %s.%s (`id` UInt64, `c` %s) ENGINE = MergeTree ORDER BY id",
+				dbName, table, c.authored)
+			if err := conn.Exec(ctx, stmt); err != nil {
+				if err2 := conn.Exec(optIn, stmt); err2 != nil {
+					t.Skipf("server rejected %s: %v", c.authored, err)
+				}
+			}
+
+			db, err := Introspect(ctx, conn, dbName, false)
+			require.NoError(t, err)
+			var got string
+			for _, tbl := range db.Tables {
+				if tbl.Name != table {
+					continue
+				}
+				for _, col := range tbl.Columns {
+					if col.Name == "c" {
+						got = col.Type
+					}
+				}
+			}
+			require.NotEmpty(t, got, "column not introspected")
+
 			want, ok := normalizeColumnType(c.authored)
 			require.True(t, ok, "authored type must canonicalize")
-			assert.Equal(t, want, byName[c.column],
+			assert.Equal(t, want, got,
 				"the canonicalized authored type must equal the introspected type;\n"+
-					"if this fails after a ClickHouse upgrade, the server's own canonical\n"+
-					"form for %s has changed and jsonOptionSorter needs to follow it",
+					"if this fails after a ClickHouse upgrade, the server's canonical form\n"+
+					"for %s has changed and canonicalizeTypeOrder must follow it",
 				c.authored)
 		})
 	}

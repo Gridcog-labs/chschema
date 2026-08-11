@@ -33,6 +33,15 @@ func TestNormalizeColumnType_Canonicalizes(t *testing.T) {
 		{"json nested in map value", "Map(String, JSON(b String, a String))", "Map(String, JSON(a String, b String))"},
 		{"json nested in a hint", "JSON(x JSON(d String, c String))", "JSON(x JSON(c String, d String))"},
 		{"tuple element order is meaningful", "Tuple(b Int32, a String)", "Tuple(b Int32, a String)"},
+		{"nested element order is meaningful", "Nested(b UInt8, a String)", "Nested(b UInt8, a String)"},
+		{"variant is a set", "Variant(UInt64, String)", "Variant(String, UInt64)"},
+		{"variant already sorted", "Variant(String, UInt64)", "Variant(String, UInt64)"},
+		{"variant nested", "Map(String, Variant(UInt64, String))", "Map(String, Variant(String, UInt64))"},
+		{"variant of json", "Variant(JSON(b String, a String), String)", "Variant(JSON(a String, b String), String)"},
+		{"enum sorted by value", "Enum8('b' = 2, 'a' = 1)", "Enum8('a'=1, 'b'=2)"},
+		{"enum negative values", "Enum16('y' = 1000, 'x' = -1)", "Enum16('x'=-1, 'y'=1000)"},
+		{"enum sorts by value not name", "Enum8('b' = 1, 'a' = 2)", "Enum8('b'=1, 'a'=2)"},
+		{"enum with implicit values untouched", "Enum8('b', 'a')", "Enum8('b', 'a')"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -132,19 +141,24 @@ func TestNormalizeColumnType_ChangesLayoutOnly(t *testing.T) {
 	}
 }
 
-// TestNormalizeColumnType_KeepsSkipRegexpOrder pins the one JSON option
-// ClickHouse does not sort. DataTypeObject::doGetName sorts typed paths and SKIP
-// paths but writes path_regexps_to_skip in insertion order, so two orderings are
-// two type names to ClickHouse. Sorting them here would canonicalize harder than
-// the server does and hide a difference it can see.
-func TestNormalizeColumnType_KeepsSkipRegexpOrder(t *testing.T) {
+// TestNormalizeColumnType_SortsSkipRegexp covers the one place this
+// canonicalizes further than ClickHouse's own type name.
+// DataTypeObject::doGetName prints path_regexps_to_skip in insertion order, so
+// two orderings are two names to the server. They are sorted here anyway,
+// because a list of patterns to ignore is semantically a set — no version can
+// read meaning into its order — and a canonical form that holds across versions
+// is what stops a mixed-version fleet manufacturing drift. See the plan doc.
+func TestNormalizeColumnType_SortsSkipRegexp(t *testing.T) {
 	got, ok := normalizeColumnType("JSON(SKIP REGEXP '^b', SKIP REGEXP '^a')")
 	require.True(t, ok)
-	assert.Contains(t, got, "SKIP REGEXP '^b'")
 	assert.Less(t,
-		strings.Index(got, "SKIP REGEXP '^b'"),
 		strings.Index(got, "SKIP REGEXP '^a'"),
-		"SKIP REGEXP order is preserved, not sorted")
+		strings.Index(got, "SKIP REGEXP '^b'"),
+		"SKIP REGEXP is sorted: %s", got)
+
+	reversed, ok := normalizeColumnType("JSON(SKIP REGEXP '^a', SKIP REGEXP '^b')")
+	require.True(t, ok)
+	assert.Equal(t, got, reversed, "either authored order must reduce to one form")
 }
 
 // TestNormalizeColumnType_KeepsSmuggledModifiers guards the one way this could

@@ -118,23 +118,32 @@ The `justfile` has the full recipe list.
   `ephemeral` / `alias` (mutually exclusive), `codec`, `ttl`,
   `comment`, `renamed_from` (drives `RENAME COLUMN` in the diff)
 - ✅ A column `type` is canonicalized on load and on introspect, like every
-  other expression-shaped field: layout (`Map(String,   String)`,
-  `Decimal( 18 , 4 )`, `Enum8('a' = 1)`) and the order of the options inside a
-  `JSON` type, including nested ones. Reordering or respacing a type is
-  therefore not drift and no longer emits a no-op `MODIFY COLUMN`. The JSON
-  order is copied from ClickHouse's `DataTypeObject::doGetName` (which sorts
-  typed paths and SKIP paths because it holds them in hash containers), never
-  invented — nothing is canonicalized harder than the server does it, so
-  `SKIP REGEXP` order, `Tuple`/`Nested` element order, enum element order and a
-  `max_dynamic_*` set to its default all still compare as they do on the
-  server. An unparseable type, and a `type` smuggling in a modifier, are kept
-  verbatim (warned once per distinct type, since the symptom is a column that
-  diffs forever). Applies to `patch_table` columns, `patch_column`, MV columns
-  and dictionary attributes. Two tests hold the assumptions: a live one
-  (CI `test-live`) asserting the canonicalized authored type equals the
-  introspected type, so a ClickHouse upgrade that renames types fails on the
-  bump; and a layout-only corpus asserting normalization never changes content,
-  so a lossy SQL-parser release can't quietly alter generated DDL
+  other expression-shaped field. Two rules: layout (`Map(String,   String)`,
+  `Decimal( 18 , 4 )`), and argument order wherever the type constructor is
+  order-insensitive — JSON options, `Variant` elements, enum elements — nested
+  types included. Respacing or reordering such a type is therefore not drift and
+  no longer emits a no-op `MODIFY COLUMN`
+- ✅ The ordering rule is **semantic, deliberately not a copy of one
+  ClickHouse version's printer**: a fleet runs several versions at once (Cloud
+  self-upgrades, clusters sit mid-upgrade, dev leads prod), and a dump is
+  compared long after its connection closed — `drift` compares two dump files
+  with no server attached — so the canonical form must be version-independent.
+  Ordering is normalized only where the constructor is a set or a map (JSON
+  typed paths/skip paths, `Variant(T1,T2)=Variant(T2,T1)`, enum by value), where
+  no version can read meaning into order. Positional lists (`Tuple`, `Nested`,
+  `Map` key/value, `Decimal` params, `AggregateFunction` args) are untouched.
+  Normalizing *less* than any server in the fleet is the harmful direction (that
+  type then diffs forever); normalizing *more* only absorbs skew, so the bias is
+  intentional — `SKIP REGEXP` is sorted even though `doGetName` does not sort it
+- ✅ An unparseable type, a `type` smuggling in a modifier, and an enum with
+  implicit values are kept verbatim (unparseable ones warn once per distinct
+  type, since the symptom is a column that diffs forever). Applies to
+  `patch_table` columns, `patch_column`, MV columns and dictionary attributes.
+  Two tests hold the assumptions: a live one (CI `test-live`, one table per type,
+  skipping types the server rejects) asserting the canonicalized authored type
+  equals the introspected type, so a ClickHouse upgrade that renames types fails
+  on the bump; and a layout-only corpus asserting normalization never changes
+  content, so a lossy SQL-parser release can't quietly alter generated DDL
 - ✅ `index` blocks; adding an index to an existing table also generates a
   `MATERIALIZE INDEX` marked manual (`-- MANUAL:` in `diff -sql`,
   `"manual": true` in JSON/plan) — heavy mutations are operator-run, never

@@ -3,6 +3,7 @@ package hcl
 import (
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -166,8 +167,9 @@ func normalizeExpr(s string) (string, bool) {
 // printer emits — the same rendering introspection produces in columnFromAST —
 // so two spellings of one type compare equal instead of generating a no-op
 // ALTER TABLE ... MODIFY COLUMN. It covers whitespace and punctuation
-// (`Map(String,   String)`, `Decimal( 18 , 4 )`, `Enum8('a' = 1)`) and, via
-// canonicalizeJSONOptions, the order of the options inside a JSON type. The
+// (`Map(String,   String)`, `Decimal( 18 , 4 )`) and, via
+// canonicalizeTypeOrder, the argument order of every order-insensitive type
+// constructor (JSON options, Variant elements, enum elements). The
 // type is parsed inside a throwaway CREATE TABLE because the grammar accepts a
 // type only in a column position. Returns ok=false with the input unchanged
 // when it can't be parsed, so the caller keeps the raw text.
@@ -187,7 +189,7 @@ func normalizeColumnType(s string) (string, bool) {
 	if !ok || cd.Type == nil || !isBareColumnType(cd) {
 		return s, false
 	}
-	canonicalizeJSONOptions(cd.Type)
+	canonicalizeTypeOrder(cd.Type)
 	return formatNode(cd.Type), true
 }
 
@@ -234,55 +236,104 @@ func jsonOptionRank(o *chparser.JSONOption) int {
 	}
 }
 
-// jsonOptionSorter puts every JSON type's options into the order ClickHouse
-// itself uses, and no stronger. ClickHouse holds a JSON type's typed paths in a
-// hash map and its skip paths in a hash set, so it has to sort both to name the
-// type at all: DataTypeObject::doGetName sorts `typed_paths` and
-// `paths_to_skip` alphabetically. `JSON(b String, a String)` and
-// `JSON(a String, b String)` are therefore one type to ClickHouse, and matching
-// that here is what stops a reordered hint list reading as drift.
+// canonicalizeTypeOrder puts the arguments of every order-insensitive type
+// constructor in t into one order, depth-first so a nested type is canonical
+// before it is used as a sort key. The AST is always a throwaway parse here, so
+// mutating it is safe.
 //
-// SKIP REGEXP is deliberately left in place: ClickHouse writes
-// `path_regexps_to_skip` in insertion order with no sort, so two orderings are
-// two type names to ClickHouse, and reordering them here would canonicalize
-// harder than the server does and hide a difference it can see.
-type jsonOptionSorter struct {
-	chparser.DefaultASTVisitor
+// The rule is semantic, not a copy of one server's printer: an argument list
+// that ClickHouse holds as a set or a map cannot carry meaning in its order, so
+// every version must agree that reordering it yields the same type. That makes
+// this normalization version-independent, which matters because a fleet can run
+// several ClickHouse versions at once — see the plan doc. Positional argument
+// lists (`Tuple`, `Nested`, `Map` key/value, `Decimal` precision/scale) are
+// never touched.
+func canonicalizeTypeOrder(t chparser.Expr) {
+	switch n := t.(type) {
+	case *chparser.JSONType:
+		if n.Options == nil {
+			return
+		}
+		for _, item := range n.Options.Items {
+			if item.Column != nil && item.Column.Type != nil {
+				canonicalizeTypeOrder(item.Column.Type)
+			}
+		}
+		sortJSONOptions(n.Options)
+	case *chparser.ComplexType:
+		for _, p := range n.Params {
+			canonicalizeTypeOrder(p)
+		}
+		// Variant is a set of types — the ClickHouse docs state
+		// `Variant(T1, T2) = Variant(T2, T1)`, and the DataTypeVariant
+		// constructor sorts by type name to enforce it — so an authored order
+		// must not diff against the server's.
+		if n.Name != nil && strings.EqualFold(n.Name.Name, "Variant") {
+			sort.SliceStable(n.Params, func(a, b int) bool {
+				return formatNode(n.Params[a]) < formatNode(n.Params[b])
+			})
+		}
+	case *chparser.NestedType:
+		// Nested/Tuple element order is positional; only descend.
+		for _, c := range n.Columns {
+			canonicalizeTypeOrder(c)
+		}
+	case *chparser.ColumnDef:
+		if n.Type != nil {
+			canonicalizeTypeOrder(n.Type)
+		}
+	case *chparser.EnumType:
+		sortEnumValues(n)
+	}
 }
 
-func (v *jsonOptionSorter) Enter(e chparser.Expr) {
-	j, ok := e.(*chparser.JSONType)
-	if !ok || j.Options == nil {
-		return
-	}
-	sort.SliceStable(j.Options.Items, func(a, b int) bool {
-		x, y := j.Options.Items[a], j.Options.Items[b]
-		rx, ry := jsonOptionRank(x), jsonOptionRank(y)
-		if rx != ry {
+// sortJSONOptions orders a JSON type's options as ClickHouse names them:
+// max_dynamic_types, max_dynamic_paths, typed-path hints, SKIP paths, then
+// SKIP REGEXP. Hints and SKIP paths are sorted because ClickHouse holds them in
+// a hash map and a hash set respectively, so no version can read meaning into
+// their order. SKIP REGEXP is sorted for the same semantic reason — a list of
+// patterns to ignore is a set — even though DataTypeObject::doGetName happens to
+// print it in insertion order today.
+func sortJSONOptions(opts *chparser.JSONOptions) {
+	sort.SliceStable(opts.Items, func(a, b int) bool {
+		x, y := opts.Items[a], opts.Items[b]
+		if rx, ry := jsonOptionRank(x), jsonOptionRank(y); rx != ry {
 			return rx < ry
-		}
-		if rx == rankSkipRegexp {
-			return false // keep the authored order; ClickHouse does not sort these
 		}
 		return x.String() < y.String()
 	})
-	// The default walk stops at a JSON type's name, so the type of each hint is
-	// descended into here: a JSON nested inside a hint needs the same treatment
-	// as one at the top level.
-	for _, item := range j.Options.Items {
-		if item.Column != nil && item.Column.Type != nil {
-			_ = item.Column.Type.Accept(v.Self)
-		}
-	}
 }
 
-// canonicalizeJSONOptions sorts the options of every JSON type in t, including
-// those nested inside Array / Map / Tuple / Nested parameters. The AST is
-// always a throwaway parse here, so mutating it is safe.
-func canonicalizeJSONOptions(t chparser.Expr) {
-	v := &jsonOptionSorter{}
-	v.Self = v
-	_ = t.Accept(v)
+// sortEnumValues orders an enum's elements by value, as ClickHouse does: the
+// EnumValues constructor sorts by numeric value, so `Enum8('b' = 2, 'a' = 1)`
+// is named `Enum8('a' = 1, 'b' = 2)` whatever order it was declared in.
+//
+// Sorting by value, never by name, is what makes this safe. An element with an
+// implicit value takes its number from its position, so the two cannot be
+// separated; an enum with any implicit element is left untouched rather than
+// risk renumbering it.
+func sortEnumValues(e *chparser.EnumType) {
+	nums := make([]int64, len(e.Values))
+	for i, v := range e.Values {
+		if v.Value == nil {
+			return
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(formatNode(v.Value)), 10, 64)
+		if err != nil {
+			return
+		}
+		nums[i] = n
+	}
+	idx := make([]int, len(e.Values))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return nums[idx[a]] < nums[idx[b]] })
+	sorted := make([]chparser.EnumValue, len(e.Values))
+	for i, j := range idx {
+		sorted[i] = e.Values[j]
+	}
+	e.Values = sorted
 }
 
 // normalizeColumnTypePtr canonicalizes an optional type string in place,

@@ -68,31 +68,82 @@ patch forms), and dictionary attributes. MV columns were not visited at
 all before, so their expressions are now canonicalized as well, matching
 declared table columns.
 
-## What happens when ClickHouse changes
+## Several ClickHouse versions at once
 
-The canonical form copies the server's, so a future ClickHouse could move
-away from it. The two directions are not symmetrical, and only one is
-harmful.
+A fleet is not on one version. Cloud upgrades itself, a self-hosted stack
+lags, a cluster spends time mid-upgrade with nodes on either side, and dev
+and prod are rarely in step. Every comparison hclexp makes can therefore
+straddle two versions: `diff` against each of two environments, `plan`
+against a dump topology, and `drift` between per-node dumps.
 
-**We normalize less than the server.** Say a version starts sorting
-`SKIP REGEXP`. The server then reports a sorted form, we keep the authored
-order, the two never match, and every schema carrying that type diffs
-forever — the reported bug, back again. This is the direction to guard.
+That rules out the obvious fix of normalizing per server version. A dump
+outlives the connection that produced it — `drift` compares two dump files
+with no server attached — so a canonical form that depended on the version
+would make two nodes' dumps incomparable, which is the one thing `drift`
+exists to do. **The canonical form has to be version-independent.**
 
-**We normalize more than the server.** Say a version stops sorting typed
-paths. Both the authored and the introspected type still pass through our
-sort, so they still match and nothing spurious appears. The cost is that a
-difference the server can see is called equal — and for an option set that
-difference cannot change storage or query results, so this is a cosmetic
-false negative, not a wrong migration.
+Which gives the rule this change follows. Do not copy a version's printer;
+canonicalize where the type constructor is *semantically* a set or a map,
+because there no version can differ:
+
+- a JSON type's typed paths are a map and its skip paths are a set —
+  ClickHouse cannot even name the type without sorting them;
+- `Variant(T1, T2) = Variant(T2, T1)` is documented type identity, and
+  `DataTypeVariant`'s constructor sorts by type name to enforce it;
+- an enum's elements are a set of (name, value) pairs, and `EnumValues`
+  sorts them by value.
+
+Reordering any of those cannot change storage or query results on any
+version, so reducing them to one form is version-proof rather than
+version-coupled. Positional argument lists — `Tuple`, `Nested`, a `Map`'s
+key and value, `Decimal`'s precision and scale, an `AggregateFunction`'s
+argument types — are never touched.
+
+Applying that rule turned up two cases where hclexp was *weaker* than every
+ClickHouse: `Variant(UInt64, String)` and `Enum8('b' = 2, 'a' = 1)` both
+diffed forever against the server's own spelling. Both are now canonical.
+
+It also reverses one earlier decision. `SKIP REGEXP` is sorted, even though
+`doGetName` prints `path_regexps_to_skip` in insertion order, because a list
+of patterns to ignore is a set: a path is skipped if any pattern matches, so
+order has no meaning, and two nodes differing only in that order behave
+identically. Sorting it is deliberately stronger than one version's type
+name, and it is the only place that is true. The trade is explicit — an
+operator comparing `SHOW CREATE TABLE` by eye would see a difference hclexp
+calls equal — and it buys immunity from a version that decides to sort them.
+
+### Which direction is harmful
+
+The two directions of divergence are not symmetrical.
+
+**Normalizing less than a server in the fleet** is the bug. That server
+reports a form we do not produce, the authored type never matches it, and
+every schema carrying that type diffs forever.
+
+**Normalizing more than a server in the fleet** is benign. Both the
+authored and the introspected type pass through our canonicalizer, so they
+still match; version skew is absorbed rather than reported. The cost is a
+cosmetic false negative on a difference that cannot affect behaviour.
+
+So the bias is deliberate: where a constructor is order-insensitive, being
+stronger than the weakest version in the fleet is what keeps a mixed-version
+estate quiet.
 
 `TestCHLive_ColumnTypeCanonicalFormMatchesServer` guards the harmful
-direction, and it guards it in CI: the `test-live` job runs the live suite
-against the docker-compose ClickHouse on every pull request, and `build`
-depends on it. The test declares each type in a non-canonical spelling,
-introspects it, and asserts the introspected form equals the canonicalized
-*authored* form. If a version bump changes the server's naming rules, that
-assertion fails on the bump rather than in someone's diff.
+direction in CI. The `test-live` job runs the live suite against the
+docker-compose ClickHouse on every pull request and `build` depends on it.
+Each type is declared in a non-canonical spelling, introspected, and the
+introspected form compared against the canonicalized authored form, so a
+version bump that changes the server's naming rules fails on the bump rather
+than in someone's diff. Each case gets its own table and a type the server
+rejects skips instead of failing, so the test is itself version-tolerant.
+
+Version differences that are *not* about ordering — a renamed engine, a new
+default setting, a clause a version starts emitting — are out of reach of
+canonicalization and handled where they arise, at the introspect edge. The
+`cloud_mode_engine` handling for Cloud's `Shared*MergeTree` rewriting is the
+precedent: converge the flavour-specific spelling onto the single HCL
+vocabulary as the schema is read, never downstream of it.
 
 The deeper risk is the SQL parser, not ClickHouse: normalization renders a
 third-party AST back to text, so a parser release that accepts a type but
@@ -115,19 +166,18 @@ The layout-only corpus addresses the same risk without that cost.
 
 ## Deliberately out of scope
 
-`Enum8('b' = 2, 'a' = 1)` is also order-independent when every element
-carries an explicit value, but reordering an enum whose values are
-implicit (`Enum8('a', 'b')`) silently renumbers it. The distinction is
-worth a separate change, not a rider on this one. Worth checking first
-whether `DataTypeEnum`'s name generation sorts, as `DataTypeObject`'s does;
-if it sorts by value, an authored reorder currently diffs against the
-server and the same argument applies.
+An enum with any implicit element (`Enum8('a', 'b')`) is left in declared
+order. Sorting by value is safe for a fully explicit enum and is what
+ClickHouse does, but an implicit element takes its number from its position,
+so position and value cannot be separated without renumbering the enum.
+Ordering is skipped for the whole type rather than guessed at.
 
 A `max_dynamic_paths` or `max_dynamic_types` written at its default value
-also still diffs, because ClickHouse omits a default parameter from the
-type name entirely. Matching that means hardcoding the defaults (1024
-paths, 32 types at the time of writing), which are version-specific
-constants in the server, so it is left alone.
+still diffs, because ClickHouse omits a default parameter from the type name
+entirely. Matching that means hardcoding the defaults (1024 paths, 32 types
+at the time of writing), and those are version-specific constants in the
+server — exactly the version coupling this design avoids elsewhere — so it
+is left alone.
 
 ## Tests
 

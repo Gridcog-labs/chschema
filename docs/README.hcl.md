@@ -127,30 +127,31 @@ normalized:
 - **Layout** — whitespace and punctuation inside the type.
   `Map(String,   String)`, `Decimal( 18 , 4 )` and `Enum8('a' = 1)` resolve to
   `Map(String, String)`, `Decimal(18, 4)` and `Enum8('a'=1)`.
-- **`JSON` option order** — `JSON(b String, a String)` and
-  `JSON(a String, b String)` resolve to one spelling. This follows ClickHouse:
-  it holds a JSON type's typed paths in a hash map and its skip paths in a hash
-  set, so `DataTypeObject::doGetName` sorts both alphabetically to name the type
-  at all. The canonical order is the server's own —
-  `max_dynamic_types`, `max_dynamic_paths`, sorted typed-path hints, sorted
-  `SKIP` paths, then `SKIP REGEXP`. Nested types are covered too, such as
-  `Array(JSON(…))`.
+- **Argument order, where the type constructor is order-insensitive.**
+  `JSON(b String, a String)`, `Variant(UInt64, String)` and
+  `Enum8('b' = 2, 'a' = 1)` resolve to `JSON(a String, b String)`,
+  `Variant(String, UInt64)` and `Enum8('a'=1, 'b'=2)`. Nested types are covered,
+  such as `Array(JSON(…))` and `Map(String, Variant(…))`.
 
 Without this, editing only the spelling of a type produced an
 `ALTER TABLE … MODIFY COLUMN` that rewrote the column to what it already was.
 
-Nothing is canonicalized harder than ClickHouse does it, so a difference the
-server can see is never hidden:
+The second rule is semantic, not a copy of one ClickHouse version's output. A
+JSON type's typed paths are a map and its skip paths a set; `Variant(T1, T2)`
+and `Variant(T2, T1)` are documented as the same type; an enum is a set of
+(name, value) pairs. Reordering any of them cannot change storage or query
+results on *any* version, which is what makes the canonical form safe across a
+fleet running several ClickHouse versions at once.
 
-- element order inside a `Tuple` or `Nested` is positional, and is left alone;
-- `SKIP REGEXP` keeps its authored order — ClickHouse writes
-  `path_regexps_to_skip` in insertion order with no sort, so two orderings are
-  two types to the server;
-- `Enum8('b' = 2, 'a' = 1)` is left alone, so it still diffs against
-  `Enum8('a' = 1, 'b' = 2)`;
-- a `max_dynamic_*` parameter written at its default value still diffs, because
-  ClickHouse omits a default from the type name and the defaults are
-  version-specific.
+Anything positional is left alone, so it still compares exactly:
+
+- element order inside a `Tuple` or `Nested`, a `Map`'s key and value, a
+  `Decimal`'s precision and scale, an `AggregateFunction`'s argument types;
+- an enum with any implicit element (`Enum8('a', 'b')`), because an implicit
+  element takes its number from its position;
+- a `max_dynamic_*` parameter written at its default value, because ClickHouse
+  omits a default from the type name and the defaults are version-specific
+  constants.
 
 The same canonicalization runs on `patch_table` columns, `patch_column`,
 materialized-view columns, and dictionary attributes. A type the SQL parser
