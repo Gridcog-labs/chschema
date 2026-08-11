@@ -179,25 +179,44 @@ func normalizeColumnType(s string) (string, bool) {
 	}
 	stmt, err := parseCreateStatement("CREATE TABLE _norm_type (_c " + s + ") ENGINE = MergeTree ORDER BY tuple()")
 	if err != nil {
+		warnUncanonicalType(s, "the SQL parser cannot read it")
 		return s, false
 	}
 	ct, ok := stmt.(*chparser.CreateTable)
 	if !ok || ct.TableSchema == nil || len(ct.TableSchema.Columns) != 1 {
+		warnUncanonicalType(s, "it did not parse as a single column type")
 		return s, false
 	}
 	cd, ok := ct.TableSchema.Columns[0].(*chparser.ColumnDef)
-	if !ok || cd.Type == nil || !isBareColumnType(cd) {
+	if !ok || cd.Type == nil {
+		warnUncanonicalType(s, "it did not parse as a single column type")
+		return s, false
+	}
+	if !isBareColumnType(cd) {
+		warnUncanonicalType(s, "it carries a column modifier; prefer the dedicated attribute (codec / default / ttl / comment)")
 		return s, false
 	}
 	canonicalizeTypeOrder(cd.Type)
 	return formatNode(cd.Type), true
 }
 
-// isBareColumnType reports whether the parsed column carries a type and
-// nothing else. A `type` that smuggles in a modifier — `type = "UInt64
-// CODEC(ZSTD(1))"` — parses fine, but rendering only the type node would drop
-// the modifier from the generated DDL. Those are kept verbatim instead, exactly
-// like a type the parser cannot read.
+// isBareColumnType reports whether the parsed column carries a type and nothing
+// else.
+//
+// This guards a hazard created by the wrapping above, not an HCL feature. The
+// parser exports no way to parse a bare type — `parseColumnType` is unexported,
+// `ParseStmts` is all there is — so the type has to be interpolated into a
+// synthetic column position, and in that position the grammar happily reads
+// anything trailing as a *modifier on the synthetic column* rather than as part
+// of the type. `type = "UInt64 CODEC(ZSTD(1))"` parses as
+// ColumnDef{Type: UInt64, Codec: ZSTD(1)}, so rendering cd.Type alone would
+// silently drop the codec.
+//
+// Nobody should write that — `codec`, `default`, `ttl` and `comment` are
+// first-class column attributes — but columnDefSQL interpolates the type
+// verbatim into the column position, so such a value did produce the DDL its
+// author meant. Canonicalizing it would break a schema that worked, so the raw
+// text stands (and warns).
 func isBareColumnType(cd *chparser.ColumnDef) bool {
 	return cd.NotNull == nil && cd.Nullable == nil &&
 		cd.DefaultExpr == nil && cd.MaterializedExpr == nil &&
@@ -355,8 +374,6 @@ func normalizeColumnTypePtr(p **string) {
 	}
 	if nt, ok := normalizeColumnType(**p); ok {
 		*p = &nt
-	} else {
-		warnUncanonicalType(**p)
 	}
 }
 
@@ -365,14 +382,14 @@ func normalizeColumnTypePtr(p **string) {
 var uncanonicalTypes sync.Map
 
 // warnUncanonicalType reports a type that could not be reduced to canonical
-// form. Without this the degradation is silent, and the symptom — that column
-// diffing forever on a spelling difference — has no visible cause. The type
-// string is the searchable key, so no table context is threaded in.
-func warnUncanonicalType(typ string) {
+// form, and why. Without this the degradation is silent, and the symptom — that
+// column diffing forever on a spelling difference — has no visible cause. The
+// type string is the searchable key, so no table context is threaded in.
+func warnUncanonicalType(typ, reason string) {
 	if _, seen := uncanonicalTypes.LoadOrStore(typ, struct{}{}); seen {
 		return
 	}
-	slog.Warn("column type could not be canonicalized; keeping raw (may diff as drift)", "type", typ)
+	slog.Warn("column type kept raw, so it may diff as drift", "type", typ, "reason", reason)
 }
 
 // normalizeTTL canonicalizes a table TTL clause to the same text introspection
@@ -434,8 +451,6 @@ func canonicalize(db *DatabaseSpec) {
 		for ai := range attrs {
 			if nt, ok := normalizeColumnType(attrs[ai].Type); ok {
 				attrs[ai].Type = nt
-			} else {
-				warnUncanonicalType(attrs[ai].Type)
 			}
 		}
 	}
@@ -496,8 +511,6 @@ func normalizeColumnExprs(cols []ColumnSpec) {
 		c := &cols[ci]
 		if nt, ok := normalizeColumnType(c.Type); ok {
 			c.Type = nt
-		} else {
-			warnUncanonicalType(c.Type)
 		}
 		normalizeExprPtr(&c.Default)
 		normalizeExprPtr(&c.Materialized)

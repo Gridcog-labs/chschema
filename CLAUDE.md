@@ -138,9 +138,16 @@ The `justfile` has the full recipe list.
   an author can settle by matching the server's spelling (though the interim DDL
   contains a real `MODIFY COLUMN`, and `drift` has no HCL to reword);
   over-normalizing would make hclexp disagree with `SHOW CREATE TABLE`
-- ✅ An unparseable type, a `type` smuggling in a modifier, and an enum with
-  implicit values are kept verbatim (unparseable ones warn once per distinct
-  type, since the symptom is a column that diffs forever). Applies to
+- ✅ Kept verbatim: an unparseable type, an enum with implicit values, and a
+  `type` carrying a column modifier (`type = "UInt64 CODEC(ZSTD(1))"`). That
+  last one guards an artefact of the normalizer, not an HCL feature: the parser
+  exports no bare-type entry point, so the type is interpolated into a synthetic
+  column position where the grammar reads anything trailing as a modifier on
+  that column — rendering the type node alone would drop it, and `columnDefSQL`
+  interpolates the type verbatim, so such a value did produce working DDL.
+  `isBareColumnType` requires a type and nothing else. Each case warns once per
+  distinct type with the reason, since the symptom is a column that diffs
+  forever. Applies to
   `patch_table` columns, `patch_column`, MV columns and dictionary attributes.
   Two tests hold the assumptions: a live one (CI `test-live`, one table per type,
   skipping types the server rejects) asserting the canonicalized authored type

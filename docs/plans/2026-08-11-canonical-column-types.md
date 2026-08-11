@@ -2,28 +2,47 @@
 
 ## Problem
 
-A column's `type` is the only expression-shaped field that is never
-canonicalized. Every other one — view and MV queries, column
-DEFAULT/MATERIALIZED/ALIAS/EPHEMERAL expressions, index expressions and
-index types, table TTL — is parsed and re-rendered through the parser's
-printer at the tail of both the load path and the introspect path, so an
-authored form and its live-introspected counterpart reduce to the same
-text (issue #136). The type string is carried verbatim from HCL and
-compared byte-for-byte in `columnsEqual`.
+Before this work, column `type`s are not canonicalized. This results in
+spurious diffs.
 
-Two spellings of the same type therefore read as a change and generate an
-`ALTER TABLE … MODIFY COLUMN` that does nothing:
+Clickhouse itself has its own mechanism for this, which we need to acknowledge.
+We don't want to get too bogged down in reproducing that, though - apart
+from being poorly specified, it can also change in Clickhouse updates.
 
-- whitespace and punctuation — `Map(String,   String)` against the
-  server's `Map(String, String)`, `Decimal( 18 , 4 )`, `Enum8('a' = 1)`
-  against `Enum8('a'=1)`;
-- ordering inside a `JSON` type — `JSON(b String, a String)` against
-  `JSON(a String, b String)`. JSON typed-path hints, SKIP paths and the
-  `max_dynamic_*` parameters are a set, not a sequence, so the order they
-  are written in carries no meaning.
+Example situations where a diff is spurious:
 
-The rogue statement is worse than noise: `MODIFY COLUMN` on a large table
-is a mutation, so a whitespace edit reads as a heavyweight migration.
+- whitespace and punctuation:
+  - `Map(String,   String)` vs `Map(String, String)`
+  - `Decimal(18, 4)` vs `Decimal( 18 , 4 )`
+- complex arguments:
+  - `JSON(a String, b String)` vs `JSON(b String, a String)`
+  - `JSON(a String, SKIP b, max_dynamic_paths=200)` vs `JSON(SKIP b, max_dynamic_paths=200, a String)`
+  - `Enum('a'=1, 'b'=2)` vs `Enum('b'=2, 'a'=1)`
+
+Counter-examples, situations where a diff is important and desired:
+
+- complex arguments:
+  - `Enum('a', 'b')` vs `Enum('b', 'a')` (for enums **without** values, order is meaningful)
+
+### Aims
+
+**Normalization is desirable**: When `hclexp` compares two types, and they are stringwise different but Clickhouse considers them
+equal, it is desirable if `hclexp` considers them equal as well. Note that we probably can't and
+shouldn't do this in all cases - it's acceptable to keep the current spurious diff in hairy or
+difficult situations, as the user is generally diffing code against a DB and is able to modify the code.
+
+But, **false negatives must not happen**: If `hclexp` were to **suppress** a diff that Clickhouse
+considers meaningful, this is buggy from the user's perspective. We must not do this.
+
+### Breakdown
+
+There are two (?) normalization approaches we do.
+
+1) Formatting. We can do this perfectly.
+
+2) Semantic. This is hairier - for example, `Enum('a'=1, 'b'2)` == `Enum('b'=2, 'a'=1)`, but `Enum('a', 'b')` != `Enum('b', 'a')`. We probably can't always get this right, so we will err on the side of continuing to emit a diff in ambiguous / difficult cases.
+
+(are there more?)
 
 ## Approach
 
@@ -33,10 +52,30 @@ throwaway `CREATE TABLE` and renders the resulting `ColumnType` node with
 `formatNode` — the identical call `columnFromAST` already makes on the
 introspect side, so both sides converge on one spelling by construction.
 A type the parser cannot read is kept verbatim, as unparseable
-expressions and queries already are. So is a `type` that smuggles in a
-column modifier (`type = "UInt64 CODEC(ZSTD(1))"`): it parses cleanly, but
-rendering the type node alone would drop the modifier from the generated
-DDL, so `isBareColumnType` rejects it and the raw text stands.
+expressions and queries already are.
+
+### The synthetic column position, and what it costs
+
+The wrapping is forced: the parser exports no way to parse a bare type
+(`parseColumnType` is unexported, `ParseStmts` is the whole public surface),
+so the type has to be interpolated into a column position. That creates one
+hazard, which is an artefact of this technique rather than anything in HCL
+or ClickHouse. In a column position the grammar reads whatever trails the
+type as a *modifier on the synthetic column*, so it lands outside the type
+node and disappears when only that node is rendered:
+
+    type = "UInt64 CODEC(ZSTD(1))"
+      → ColumnDef{Type: UInt64, Codec: ZSTD(1)}
+      → rendering cd.Type gives "UInt64", and the codec is gone
+
+Nobody should write that — `codec`, `default`, `ttl` and `comment` are
+first-class `column` attributes — but `columnDefSQL` interpolates the type
+verbatim into the column position of generated DDL, so a value like it did
+produce the DDL its author meant. Canonicalizing it would silently drop part
+of a schema that worked. `isBareColumnType` therefore requires the parsed
+column to carry a type and nothing else; anything else keeps its raw text
+and warns, naming the modifier as the reason. The same guard covers
+`String NULL`, `UInt64 DEFAULT 5` and `String COMMENT 'x'`.
 
 Before rendering, the type tree is walked and every `JSON` type's options
 are put into the order ClickHouse itself uses. The walk descends through
